@@ -10,12 +10,27 @@
 #include <ctype.h>
 #include <sys/wait.h>
 
+#define INPUT_BUFFER_SIZE 1024
+#define OUTPUT_BUFFER_SIZE 1024
+
 using namespace std;
+
+enum output_type
+{
+    STD_OUTPUT,
+    FILE_OUTPUT
+};
 
 struct command
 {
     string executable;
     vector<string> args;
+};
+
+struct output
+{
+    output_type type;
+    string destination; // Používá se pro file output
 };
 
 string trim(string t_input)
@@ -56,12 +71,36 @@ command parse_command(string t_command)
     return l_result;
 }
 
-vector<command> parse_input(const char *t_input)
+vector<command> parse_input(const char *t_input, output *out)
 {
     string l_input = t_input;
     vector<string> l_comands;
     size_t l_command_start = 0, l_command_end = 0;
     vector<command> l_result;
+
+    // Vyhodnocení cíle výstupu
+    size_t l_arrow_position = l_input.find('>', l_command_start);
+    if (l_arrow_position != string::npos)
+    {
+        l_arrow_position++; // Operátor přesměrování přeskakujeme
+        string l_destination = l_input.substr(l_arrow_position, l_input.size() - l_arrow_position);
+        l_destination = trim(l_destination);
+        if (l_destination.size() == 0)
+        {
+            fprintf(stderr, "Invalid output destination!\n");
+            exit(1);
+        }
+
+        out->type = FILE_OUTPUT;
+        out->destination = l_destination;
+
+        l_input = l_input.substr(l_command_start, l_arrow_position - l_command_start - 1); // Aktualizace vstupu (seříznutí o destination)
+    }
+    else
+    {
+        out->type = STD_OUTPUT;
+        out->destination = ""; // Pro STD output se nepoužívá, tak jej pouze uklidíme
+    }
 
     // Explode příkazů
     while ((l_command_end = l_input.find('|', l_command_start)) != string::npos)
@@ -81,27 +120,23 @@ vector<command> parse_input(const char *t_input)
     return l_result;
 }
 
-int main()
+int process_command(command t_command, int input_pipe)
 {
-    char input[1024];
+    int output_pipe[2];
+    pipe(output_pipe);
 
-    printf("$ ");
-    fgets(input, sizeof(input), stdin);
-
-    size_t length = strlen(input);
-    if (length > 0 && input[length - 1] == '\n')
-        input[length - 1] = '\0'; // Nahrazení newline za konec řetězce
-
-    vector<command> l_commands = parse_input(input);
-
-    for (auto &&command : l_commands)
+    if (fork() == 0)
     {
+        close(output_pipe[0]);
+        dup2(output_pipe[1], STDOUT_FILENO);
+        dup2(input_pipe, STDIN_FILENO);
+
         vector<char *> args;
         char *l_tmp_str = nullptr;
 
-        l_tmp_str = const_cast<char *>(command.executable.c_str());
+        l_tmp_str = const_cast<char *>(t_command.executable.c_str());
         args.push_back(l_tmp_str);
-        for (auto &&arg : command.args)
+        for (auto &&arg : t_command.args)
         {
             l_tmp_str = const_cast<char *>(arg.c_str());
             args.push_back(l_tmp_str);
@@ -109,68 +144,79 @@ int main()
         args.push_back(nullptr);
 
         char **argsv = args.data();
-
-        printf("Name: %s\n", argsv[0]);
-
         execvp(argsv[0], argsv);
+        exit(1); // Tady by to nemělo ani dojít
     }
 
-    // int l_pipe[2], l_pipe_2[2];
-    // pipe(l_pipe);
-    // pipe(l_pipe_2);
+    close(output_pipe[1]);
+    wait(NULL);
 
-    // if (fork() == 0)
-    // {
-    //     close(l_pipe[0]);
-    //     close(l_pipe_2[0]);
-    //     close(l_pipe_2[1]);
-    //     dup2(l_pipe[1], 1);
-    //     close(l_pipe[1]);
+    return output_pipe[0]; // Řizení předáváme zpět a s tím i konec pro čtení
+}
 
-    //     int l_file_descriptor = open("lsout.txt", O_CREAT | O_RDWR | O_TRUNC, 0600);
-    //     dup2(l_file_descriptor, 1);
-    //     close(l_file_descriptor);
+void process_output(output out, int input_pipe_read_end)
+{
+    char buffer[OUTPUT_BUFFER_SIZE];
+    ssize_t read_size;
 
-    //     char *args[] = {"ls", "-la", "/usr", "/var", nullptr};
-    //     execvp(args[0], args);
+    if (out.type == STD_OUTPUT)
+    {
+        while ((read_size = read(input_pipe_read_end, buffer, OUTPUT_BUFFER_SIZE)) > 0)
+        {
+            write(STDOUT_FILENO, buffer, read_size);
+        }
+    }
+    else if (out.type == FILE_OUTPUT)
+    {
+        FILE *file = fopen(out.destination.c_str(), "w");
+        while ((read_size = read(input_pipe_read_end, buffer, OUTPUT_BUFFER_SIZE)) > 0)
+        {
+            fwrite(buffer, 1, read_size, file);
+        }
+        fclose(file);
+    }
+    else
+    {
+        fprintf(stderr, "Undefined output type!\n");
+        exit(1);
+    }
 
-    //     fprintf(stderr, "!!! Program should not reach this content... !!!");
-    //     exit(1);
-    // }
+    close(input_pipe_read_end);
+}
 
-    // if (fork() == 0)
-    // {
-    //     close(l_pipe[1]);
-    //     close(l_pipe_2[0]);
-    //     dup2(l_pipe[0], 0);
-    //     dup2(l_pipe_2[1], 1);
-    //     close(l_pipe[0]);
-    //     close(l_pipe_2[1]);
+int main()
+{
+    char input[INPUT_BUFFER_SIZE];
+    int input_pipe_read_end = open("/dev/null", O_RDONLY);
 
-    //     execlp("tr", "tr", "[a-z]", "[A-Z]", nullptr);
-    //     fprintf(stderr, "!!! Program should not reach this content... !!!");
-    //     exit(1);
-    // }
+    while (true)
+    {
+        printf("$ ");
+        fflush(stdout);
+        fgets(input, sizeof(input), stdin);
+        output out;
 
-    // close(l_pipe[0]);
-    // close(l_pipe[1]);
-    // close(l_pipe_2[1]);
+        size_t length = strlen(input);
+        if (length > 0 && input[length - 1] == '\n')
+            input[length - 1] = '\0'; // Nahrazení newline za konec řetězce
 
-    // while (true)
-    // {
-    //     char buffer[128];
-    //     int len = read(l_pipe[0], buffer, sizeof(buffer));
-    //     if (len <= 0)
-    //         break;
-    //     for (int i = 0; i < len; i++)
-    //         buffer[i] = toupper(buffer[i]);
+        vector<command> l_commands = parse_input(input, &out);
+        if (l_commands.size() > 10) // Nastavení limitu pro vstup uživatele v jednom řádku
+        {
+            fprintf(stderr, "Exceeded limit of 10 commands in row!\n");
+            exit(1);
+        }
 
-    //     write(1, buffer, sizeof(len));
-    // }
+        // Zpracování příkazů
+        for (auto &&command : l_commands)
+        {
+            input_pipe_read_end = process_command(command, input_pipe_read_end);
+        }
 
-    // close(l_pipe[0]);
-    // wait(nullptr);
-    // wait(nullptr);
+        // Vypsání výstupu
+        process_output(out, input_pipe_read_end);
+        printf("\n");
+    }
 
     return 0;
 }
